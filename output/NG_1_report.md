@@ -1,6 +1,6 @@
 # 瑕疵檢測報告：NG_1.bmp
 
-- 執行時間：2026-10-21 00:11:16
+- 執行時間：2026-10-21 00:14:30
 - 檢測模式：無參考模式（頂帽運算 + SimpleBlobDetector）
 - 待檢影像：`D:\GitHub\MBA_Lab1\Imgs\Final_Images\NG_1.bmp`
 - 影像尺寸：1536 x 1152
