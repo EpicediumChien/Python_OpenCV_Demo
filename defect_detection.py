@@ -24,7 +24,7 @@ import numpy as np
 sys.stdout.reconfigure(encoding="utf-8")
 
 # 預設路徑
-DEFAULT_IMAGE = Path(r"D:\GitHub\MBA_Lab1\Imgs\Final_Images\NG_1.bmp")
+DEFAULT_IMAGE = Path(__file__).resolve().parent / "NG_1.bmp"
 DEFAULT_OUTPUT = Path(__file__).resolve().parent / "output"
 
 # 兩種模式各自的預設最小面積（像素）
@@ -54,10 +54,11 @@ def read_color(path: Path) -> np.ndarray:
 # 無參考模式
 # ---------------------------------------------------------------------------
 
-def detect_blobs(gray: np.ndarray, tophat_size: int = 15, min_thresh: int = 15,
-                 max_thresh: int = 60, min_area: int = 8, max_area: int = 150,
+def detect_blobs(gray: np.ndarray, tophat_size: int = 15, thresh: int = 30,
+                 min_area: int = 8, max_area: int = 150,
                  min_circularity: float = 0.7, min_convexity: float = 0.8,
-                 max_radius: float | None = None):
+                 max_radius: float | None = None,
+                 exclude_mask: np.ndarray | None = None):
     """
     在不需要參考影像的情況下找出「比周圍亮、尺寸小、形狀接近圓形」的斑點。
 
@@ -73,35 +74,34 @@ def detect_blobs(gray: np.ndarray, tophat_size: int = 15, min_thresh: int = 15,
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (tophat_size, tophat_size))
     tophat = cv2.morphologyEx(blurred, cv2.MORPH_TOPHAT, kernel)
 
-    params = cv2.SimpleBlobDetector_Params()
-    params.filterByColor = True
-    params.blobColor = 255  # 偵測亮斑
-    params.minThreshold = min_thresh
-    params.maxThreshold = max_thresh
-    params.thresholdStep = 5
-    params.filterByArea = True
-    params.minArea = min_area
-    params.maxArea = max_area
-    params.filterByCircularity = True
-    params.minCircularity = min_circularity
-    params.filterByConvexity = True
-    params.minConvexity = min_convexity
-    params.filterByInertia = True
-    params.minInertiaRatio = 0.5
-
-    keypoints = cv2.SimpleBlobDetector_create(params).detect(tophat)
+    # 以頂帽影像二值化後直接取輪廓，保留瑕疵的真實形狀（不再只有圓心與半徑）
+    _, mask = cv2.threshold(tophat, thresh, 255, cv2.THRESH_BINARY)
+    if exclude_mask is not None:
+        mask = cv2.bitwise_and(mask, cv2.bitwise_not(exclude_mask))
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
 
     defects = []
-    for kp in keypoints:
-        cx, cy = kp.pt
-        radius = kp.size / 2.0
+    for c in contours:
+        area = cv2.contourArea(c)
+        perimeter = cv2.arcLength(c, True)
+        if area < min_area or area > max_area or perimeter == 0:
+            continue
+        circularity = 4 * math.pi * area / (perimeter * perimeter)
+        if circularity < min_circularity:
+            continue
+        hull_area = cv2.contourArea(cv2.convexHull(c))
+        if hull_area > 0 and area / hull_area < min_convexity:
+            continue
+        (cx, cy), radius = cv2.minEnclosingCircle(c)
         if max_radius is not None and radius >= max_radius:
             continue
+        x, y, w, h = cv2.boundingRect(c)
         defects.append({
-            "x": int(cx - radius), "y": int(cy - radius),
-            "w": int(2 * radius), "h": int(2 * radius),
+            "x": x, "y": y, "w": w, "h": h,
             "cx": float(cx), "cy": float(cy),
-            "area": int(math.pi * radius * radius), "radius": float(radius),
+            "area": int(area), "radius": float(radius),
+            "perimeter": float(perimeter), "circularity": float(circularity),
+            "contour": c,
         })
 
     defects.sort(key=lambda d: d["area"], reverse=True)
@@ -183,10 +183,14 @@ def detect_defects_ref(image: np.ndarray, reference: np.ndarray, valid: np.ndarr
         if max_radius is not None and radius >= max_radius:
             continue
 
+        contour = max(cv2.findContours((labels == i).astype(np.uint8), cv2.RETR_EXTERNAL,
+                                       cv2.CHAIN_APPROX_NONE)[0], key=cv2.contourArea)
         defects.append({
             "x": int(x), "y": int(y), "w": int(w), "h": int(h),
             "cx": float(cx), "cy": float(cy),
             "area": int(area), "radius": float(radius),
+            "perimeter": float(cv2.arcLength(contour, True)), "circularity": 0.0,
+            "contour": contour,
         })
 
     defects.sort(key=lambda d: d["area"], reverse=True)
@@ -204,14 +208,17 @@ def detect_edges(gray: np.ndarray, low: int = 50, high: int = 150) -> np.ndarray
 
 
 def draw_result(color_img: np.ndarray, defects) -> np.ndarray:
-    """以圓圈標出瑕疵（圓心與半徑取自偵測結果）並編號。"""
+    """描出每個瑕疵的實際輪廓（邊緣形狀）並編號。"""
     out = color_img.copy()
     for idx, d in enumerate(defects, start=1):
-        center = (int(round(d["cx"])), int(round(d["cy"])))
-        r = int(round(d["radius"])) + 8  # 比瑕疵再大一圈，避免蓋住邊緣
-        cv2.circle(out, center, r, (0, 0, 255), 3)
-        cv2.putText(out, f"#{idx}", (center[0] - r, max(center[1] - r - 8, 15)),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+        # 輪廓向外膨脹一點再描線，避免紅線蓋住瑕疵本體
+        blob = np.zeros(out.shape[:2], np.uint8)
+        cv2.drawContours(blob, [d["contour"]], -1, 255, cv2.FILLED)
+        blob = cv2.dilate(blob, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)))
+        outline, _ = cv2.findContours(blob, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+        cv2.drawContours(out, outline, -1, (0, 0, 255), 2)
+        cv2.putText(out, f"#{idx}", (d["x"] + d["w"] + 6, max(d["y"] - 6, 15)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
     status = "NG" if defects else "OK"
     color = (0, 0, 255) if defects else (0, 200, 0)
     cv2.putText(out, f"{status}: {len(defects)} defect(s)", (20, 45),
@@ -252,13 +259,14 @@ def write_report(path: Path, args, method: str, params: list, shape,
 
     if defects:
         lines += [
-            "| # | 圓心 X | 圓心 Y | 半徑 (px) | 面積 (px) |",
-            "|---|--------|--------|-----------|-----------|",
+            "| # | 中心 X | 中心 Y | 外接圓半徑 (px) | 面積 (px) | 周長 (px) | 圓度 |",
+            "|---|--------|--------|-----------------|-----------|-----------|------|",
         ]
         for idx, d in enumerate(defects, start=1):
             lines.append(
                 f"| {idx} | {d['cx']:.0f} | {d['cy']:.0f} | "
-                f"{d['radius']:.1f} | {d['area']} |"
+                f"{d['radius']:.1f} | {d['area']} | {d['perimeter']:.1f} | "
+                f"{d['circularity']:.2f} |"
             )
         lines.append("")
 
@@ -295,6 +303,11 @@ def main():
                         help="只保留半徑小於此值（像素）的瑕疵並以圓圈標出；未指定則全部標出")
     parser.add_argument("--tophat-size", type=int, default=15,
                         help="頂帽運算結構元素大小（無參考模式），需大於要找的小點")
+    parser.add_argument("--thresh", type=int, default=30,
+                        help="頂帽影像二值化門檻 0-255（無參考模式），越小越敏感")
+    parser.add_argument("--exclude", type=str, action="append", default=[],
+                        metavar="X,Y,W,H",
+                        help="不檢測的矩形區域（無參考模式），可重複指定，例如焊墊、絲印")
     parser.add_argument("--min-circularity", type=float, default=0.7,
                         help="最小圓度 0-1（無參考模式），越高越只抓圓形")
     parser.add_argument("--diff-thresh", type=int, default=40,
@@ -322,16 +335,24 @@ def main():
 
     if args.reference is None:
         # ---- 無參考模式 ----
-        method = "無參考模式（頂帽運算 + SimpleBlobDetector）"
+        method = "無參考模式（頂帽運算 + 輪廓分析）"
         min_area = args.min_area if args.min_area is not None else DEFAULT_MIN_AREA_BLOB
+        exclude_mask = None
+        if args.exclude:
+            exclude_mask = np.zeros(image.shape, np.uint8)
+            for spec in args.exclude:
+                ex, ey, ew, eh = (int(v) for v in spec.split(","))
+                exclude_mask[ey:ey + eh, ex:ex + ew] = 255
         defects, tophat = detect_blobs(
-            image, tophat_size=args.tophat_size, min_area=min_area,
+            image, tophat_size=args.tophat_size, thresh=args.thresh, min_area=min_area,
             max_area=args.max_area, min_circularity=args.min_circularity,
-            max_radius=args.max_radius,
+            max_radius=args.max_radius, exclude_mask=exclude_mask,
         )
         inliers = 0
         params[0:0] = [
             ("頂帽結構元素 `--tophat-size`", f"{args.tophat_size} px"),
+            ("二值化門檻 `--thresh`", f"{args.thresh}"),
+            ("排除區域 `--exclude`", "; ".join(args.exclude) if args.exclude else "無"),
             ("最小面積 `--min-area`", f"{min_area} px"),
             ("最大面積 `--max-area`", f"{args.max_area} px"),
             ("最小圓度 `--min-circularity`", f"{args.min_circularity}"),
@@ -370,7 +391,7 @@ def main():
     cv2.imwrite(str(args.output / f"{stem}_result.png"), result)
 
     outputs = {
-        f"{stem}_result.png": "彩色標註影像：紅色圓圈為瑕疵，左上角為 OK/NG 判定",
+        f"{stem}_result.png": "彩色標註影像：紅色輪廓為瑕疵實際邊緣，左上角為 OK/NG 判定",
         **outputs,
         f"{stem}_edges.png": "原始待檢影像的 Canny 邊緣偵測結果",
     }
